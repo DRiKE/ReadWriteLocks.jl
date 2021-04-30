@@ -23,7 +23,7 @@ mutable struct ReadWriteLock{L<:LockTypes} <: AbstractLock
     readers::Int
     writer::Bool
     lock::L  # reentrant mutex
-    condition::Condition
+    condition::Threads.Condition
     read_lock::ReadLock
     write_lock::WriteLock
 
@@ -31,7 +31,7 @@ mutable struct ReadWriteLock{L<:LockTypes} <: AbstractLock
         readers::Int=0,
         writer::Bool=false,
         lock::L=ReentrantLock(),
-        condition::Condition=Condition(),
+        condition::Threads.Condition=Threads.Condition(),
     ) where L <: LockTypes
         rwlock = new{L}(readers, writer, lock, condition)
         rwlock.read_lock = ReadLock(rwlock)
@@ -50,10 +50,18 @@ function lock!(read_lock::ReadLock)
 
     try
         while rwlock.writer
+            unlock(rwlock.lock)
+            lock(rwlock.condition)
             wait(rwlock.condition)
+            lock(rwlock.lock)
+            unlock(rwlock.condition)
         end
 
         rwlock.readers += 1
+    catch e
+        @error "ReadWriteLocks: exception", e
+        display(stacktrace(catch_backtrace()))
+        throw(e)
     finally
         unlock(rwlock.lock)
     end
@@ -67,27 +75,46 @@ function unlock!(read_lock::ReadLock)
 
     try
         rwlock.readers -= 1
-        if rwlock.readers == 0
-            notify(rwlock.condition; all=true)
+        if rwlock.readers < 0
+            @error "ReadWriteLocks: negative reader count"
+            throw("negative reader count")
         end
+    catch e
+        @error "ReadWriteLocks: exception", e
+        display(stacktrace(catch_backtrace()))
+        throw(e)
     finally
-        unlock(rwlock.lock)
+        if rwlock.readers == 0
+            lock(rwlock.condition)
+            notify(rwlock.condition; all=true)
+            unlock(rwlock.lock)
+            unlock(rwlock.condition)
+        else
+            unlock(rwlock.lock)
+        end
     end
-
     return nothing
 end
 
 function lock!(write_lock::WriteLock)
     rwlock = write_lock.rwlock
     lock(rwlock.lock)
+    lock(rwlock.condition)
 
     try
         while rwlock.readers > 0 || rwlock.writer
+            unlock(rwlock.lock)
             wait(rwlock.condition)
+            lock(rwlock.lock)
         end
 
         rwlock.writer = true
+    catch e
+        @error "ReadWriteLocks: exception", e
+        display(stacktrace(catch_backtrace()))
+        throw(e)
     finally
+        unlock(rwlock.condition)
         unlock(rwlock.lock)
     end
 
@@ -100,8 +127,14 @@ function unlock!(write_lock::WriteLock)
 
     try
         rwlock.writer = false
+        lock(rwlock.condition)
         notify(rwlock.condition; all=true)
+    catch e
+        @error "ReadWriteLocks: exception", e
+        display(stacktrace(catch_backtrace()))
+        throw(e)
     finally
+        unlock(rwlock.condition)
         unlock(rwlock.lock)
     end
 
